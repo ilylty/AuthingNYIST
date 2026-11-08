@@ -611,7 +611,7 @@ func main() {
 	 auth-nyist [options] keepalive [keepalive_options]
 	 auth-nyist [options] probe [probe_options]`,
 		Usage:    "Authenticating utility for NYIST",
-		Version:  "2.3.0",
+		Version:  "2.4.0",
 		HideHelp: true,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "username, u", Usage: "your portal account `name`"},

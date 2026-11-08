@@ -25,7 +25,7 @@ USAGE:
    auth-nyist [options] probe [probe_options]
 
 VERSION:
-   2.3.0
+   2.4.0
 
 COMMANDS:
      auth       (default) Auth via auth.nyist.edu.cn
