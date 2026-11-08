@@ -85,12 +85,29 @@ func buildLoginParams(username, password, token string, logout bool, anotherIP s
 	return
 }
 
+// loginTimeout returns the HTTP timeout used for portal requests. A bound net
+// keeps its configured dial timeout so a slow campus link does not abort the
+// challenge exchange.
+func loginTimeout(host *UrlProvider) time.Duration {
+	if host != nil && host.net != nil && host.net.Options.Timeout > 0 {
+		return host.net.Options.Timeout
+	}
+	return time.Second * 5
+}
+
 func GetJSON(baseUrl string, params url.Values) (string, error) {
+	return GetJSONWithNet(nil, baseUrl, params, 0)
+}
+
+// GetJSONWithNet performs the JSONP GET through n. A nil n follows the system
+// routing, and a zero timeout selects the default.
+func GetJSONWithNet(n *Net, baseUrl string, params url.Values, timeout time.Duration) (string, error) {
 	const CB = "C_a_l_l_b_a_c_k"
 	params.Set("callback", CB)
-	var netClient = &http.Client{
-		Timeout: time.Second * 2,
+	if timeout <= 0 {
+		timeout = time.Second * 2
 	}
+	netClient := n.HTTPClientWithRedirect(timeout, nil)
 	url := baseUrl + "?" + params.Encode()
 	logger.Debugf("GET \"%s\"\n", url)
 
@@ -114,23 +131,20 @@ func GetJSON(baseUrl string, params url.Values) (string, error) {
 }
 
 func IsOnline(host *UrlProvider, acID string) (online bool, err error, username string) {
-	var netClient = &http.Client{
-		Timeout: time.Second * 2,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			logger.Debugf("REDIRECT \"%v\"\n", req.URL)
-			if strings.Index(req.URL.Path, "succeed_wired.php") != -1 {
-				online = true
-				regexUsername := regexp.MustCompile(`username=([-a-zA-Z0-9]+)`)
-				matches := regexUsername.FindStringSubmatch(req.URL.RawQuery)
-				if len(matches) > 0 {
-					username = matches[1]
-					logger.Debugf("Extracted username: \"%s\"\n", username)
-				}
-
+	netClient := host.net.HTTPClientWithRedirect(time.Second*2, func(req *http.Request, via []*http.Request) error {
+		logger.Debugf("REDIRECT \"%v\"\n", req.URL)
+		if strings.Index(req.URL.Path, "succeed_wired.php") != -1 {
+			online = true
+			regexUsername := regexp.MustCompile(`username=([-a-zA-Z0-9]+)`)
+			matches := regexUsername.FindStringSubmatch(req.URL.RawQuery)
+			if len(matches) > 0 {
+				username = matches[1]
+				logger.Debugf("Extracted username: \"%s\"\n", username)
 			}
-			return nil
-		},
-	}
+
+		}
+		return nil
+	})
 	online = false
 	params := url.Values{
 		"ac_id": []string{acID},
@@ -156,7 +170,7 @@ func IsOnline(host *UrlProvider, acID string) (online bool, err error, username 
 
 func LoginLogout(username, password string, host *UrlProvider, logout bool, anotherIP string, acID string) (err error) {
 	logger.Debugf("Getting challenge...\n")
-	body, err := GetJSON(host.ChallengeUriBase(), buildChallengeParams(username, anotherIP))
+	body, err := GetJSONWithNet(host.net, host.ChallengeUriBase(), buildChallengeParams(username, anotherIP), loginTimeout(host))
 	if err != nil {
 		return
 	}
@@ -183,7 +197,7 @@ func LoginLogout(username, password string, host *UrlProvider, logout bool, anot
 		return
 	}
 	logger.Debugf("Sending login request...\n")
-	body, err = GetJSON(host.LoginUriBase(), loginParams)
+	body, err = GetJSONWithNet(host.net, host.LoginUriBase(), loginParams, loginTimeout(host))
 	if err != nil {
 		return
 	}

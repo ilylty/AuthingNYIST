@@ -21,7 +21,8 @@ USAGE:
    auth-nyist [options]
    auth-nyist [options] auth [auth_options]
    auth-nyist [options] deauth [auth_options]
-   auth-nyist [options] online [online_options]
+   auth-nyist [options] keepalive [keepalive_options]
+   auth-nyist [options] probe [probe_options]
 
 VERSION:
    2.0.0
@@ -29,7 +30,8 @@ VERSION:
 COMMANDS:
      auth       (default) Auth via auth.nyist.edu.cn
      deauth     De-authenticate via auth.nyist.edu.cn
-     keepalive  Keep the connection alive by pinging a server
+     keepalive  Keep the connection alive by probing a server through the campus adapter
+     probe      Probe the campus link once and report the result
 
 GLOBAL OPTIONS:
    --username name, -u name          your portal account name
@@ -38,6 +40,10 @@ GLOBAL OPTIONS:
    --hook-success value              command line to be executed in shell after successful login/out
    --daemonize, -D                   run without reading username/password from standard input; less log
    --debug                           print debug messages
+   --interface name, -i name         bind every socket to this network name (e.g. wlan0, WLAN, en0; auto = default-route adapter)
+   --source-ip ip                    pin this local source ip instead of deriving it from --interface
+   --dns servers                     comma separated resolver servers, e.g. 59.69.128.96
+   --insecure                        skip TLS certificate verification
    --help, -h                        print the help
    --version, -v                     print the version
 ```
@@ -56,11 +62,77 @@ Write a config file to store your username & password or other options in the fo
   "noCheck": false,
   "insecure": false,
   "daemonize": false,
-  "acId": ""
+  "acId": "",
+
+  "adapter": "auto",
+  "sourceIp": "",
+  "dns": "59.69.128.96",
+  "probeUrl": "http://122.207.209.6:8080/",
+  "probeMode": "http",
+  "probeExpect": "",
+  "probeLocation": "",
+  "interval": 5,
+  "timeout": 5,
+  "retries": 1
 }
 ```
 
 Unless you have special need, you can only have `username` and `password` field in your config file. For `host`, the default value defined in code should be sufficient hence there should be no need to fill it. `UseV6` automatically determine the `host` to use. For `ip`, unless you are auth/login the other boxes you have(not the box `auth-nyist` is running on), you can leave it blank. For those boxes unable to get correct acid themselves, we can specify the acid for them by using `acId`. Other options are self-explanatory.
+
+### Network binding (TUN / fake-ip proxy clients)
+
+If a proxy client owns the default route through a TUN interface (Hiddify, Clash Meta, sing-box, Surge …), the campus link is only reachable by name or by a route rule, and a plain `connect()` completes against the tunnel stack instead of the portal. Three settings keep the tool and its keepalive probe on the real link:
+
+| Key | Meaning |
+| --- | --- |
+| `adapter` | Interface every socket is bound to. `auto` picks the wireless adapter that owns the default route, skipping `tun*`/`utun*`/`Meta` and container bridges. `wlan0`, `WLAN`, `en0` … also work. |
+| `sourceIp` | Local source address. Derived from `adapter` when empty; set it only when an adapter holds several addresses. |
+| `dns` | Resolvers used instead of the system resolver, e.g. `59.69.128.96`. Applied automatically (with `59.69.128.96`) whenever `adapter` is set and this key is empty, because a proxy in `fake-ip` mode otherwise resolves campus names to `198.18.x.x`, which are unreachable from the bound campus socket. |
+
+Binding behaviour per platform:
+
+- Linux: `SO_BINDTODEVICE` plus the source address. The socket option needs `CAP_NET_RAW`, so run as root or grant the capability; without it the tool warns once and falls back to source address pinning.
+- Windows: `IP_UNICAST_IF` with the interface index in network byte order, plus the source address.
+- macOS: `IP_BOUND_IF` plus the source address.
+- Other platforms: source address pinning only.
+
+Check the result before trusting a keepalive loop:
+
+```shell
+auth-nyist -i auto --dns 59.69.128.96 probe
+# INFO Probe http://122.207.209.6:8080/ using interface=wlan0 source=10.2.41.236 dns=59.69.128.96:53
+# INFO http://122.207.209.6:8080/ 302 in 32ms
+```
+
+`--dns` can be omitted when `--interface` is set: the campus resolver is then selected automatically. Pass `--dns` explicitly only when the deployment uses a different resolver.
+
+A minimal configuration for the TUN case is therefore:
+
+```json
+{
+  "username": "your-username",
+  "password": "your-password",
+  "adapter": "auto",
+  "keepOnline": true
+}
+```
+
+### Why the probe is an HTTP round trip
+
+A TUN client terminates TCP in user space: it answers the SYN itself and opens the upstream connection afterwards. A successful `connect()` therefore proves only that the tunnel stack replied, never that the upstream host is reachable (issue #4). The probe defaults to `http` for that reason.
+
+- `probeMode: "http"` (default) requires a complete HTTP response. With `probeExpect`/`probeLocation` you can pin the expected answer, for example `"probeExpect": "302"` with `"probeLocation": "/opac/search/simsearch"` for the NYIST library.
+- `probeMode: "tcp"` keeps the old handshake-only check. It is cheap and correct only when the probe is bound to the campus adapter.
+- `interval` is the probe period in seconds, `timeout` the per-probe budget, and `retries` how many consecutive failures trigger a re-authentication.
+
+Tuning the probe from the command line:
+
+```shell
+auth-nyist probe --url http://127.0.0.1:1/ --timeout 2 ; echo "exit=$?"
+auth-nyist keepalive --url http://122.207.209.6:8080/ --interval 10 --retries 2
+```
+
+`probe` exits with status 2 when the probe fails, which makes it usable from cron or a health check.
 
 ## Autostart
 

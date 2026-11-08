@@ -3,10 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -32,6 +30,29 @@ type Settings struct {
 	Daemon   bool   `json:"daemonize"`
 	Debug    bool   `json:"debug"`
 	AcID     string `json:"acId"`
+
+	// Adapter pins every socket (probe, portal requests, DNS) to one network
+	// interface. "auto" picks the interface that owns the default route.
+	Adapter string `json:"adapter"`
+	// SourceIP overrides the address derived from Adapter.
+	SourceIP string `json:"sourceIp"`
+	// DNS lists campus resolvers used instead of the system resolver, so a
+	// fake-ip TUN resolver cannot answer campus names.
+	DNS string `json:"dns"`
+	// ProbeURL is the connectivity target checked by keepalive.
+	ProbeURL string `json:"probeUrl"`
+	// ProbeMode is "http" (default) or "tcp".
+	ProbeMode string `json:"probeMode"`
+	// ProbeExpect lists accepted HTTP status codes for the probe.
+	ProbeExpect string `json:"probeExpect"`
+	// ProbeLocation requires a substring in the probe redirect Location.
+	ProbeLocation string `json:"probeLocation"`
+	// Interval is the keepalive probe period in seconds.
+	Interval int `json:"interval"`
+	// Timeout is the per-probe timeout in seconds.
+	Timeout int `json:"timeout"`
+	// Retries is how many consecutive probe failures trigger a re-auth.
+	Retries int `json:"retries"`
 }
 
 var logger = loggo.GetLogger("auth-nyist")
@@ -75,14 +96,57 @@ func mergeCliSettings(c *cli.Context) {
 		merged.HookSucc = settings.HookSucc
 	}
 	merged.NoCheck = settings.NoCheck || c.Bool("no-check")
-	merged.V6 = settings.V6 || c.Bool("ipv6")
+	merged.V6 = settings.V6 || c.GlobalBool("ipv6")
 	merged.KeepOn = settings.KeepOn || c.Bool("keep-online")
-	merged.Insecure = settings.Insecure || c.Bool("insecure")
+	merged.Insecure = settings.Insecure || c.GlobalBool("insecure")
 	merged.Daemon = settings.Daemon || c.GlobalBool("daemonize")
 	merged.Debug = settings.Debug || c.GlobalBool("debug")
-	merged.AcID = c.String("ac-id")
+	merged.AcID = c.GlobalString("ac-id")
 	if len(merged.AcID) == 0 {
 		merged.AcID = settings.AcID
+	}
+	merged.Adapter = c.GlobalString("interface")
+	if len(merged.Adapter) == 0 {
+		merged.Adapter = settings.Adapter
+	}
+	merged.SourceIP = c.GlobalString("source-ip")
+	if len(merged.SourceIP) == 0 {
+		merged.SourceIP = settings.SourceIP
+	}
+	merged.DNS = c.GlobalString("dns")
+	if len(merged.DNS) == 0 {
+		merged.DNS = settings.DNS
+	}
+	merged.ProbeURL = c.String("probe-url")
+	if len(merged.ProbeURL) == 0 {
+		merged.ProbeURL = c.String("url")
+	}
+	if len(merged.ProbeURL) == 0 {
+		merged.ProbeURL = settings.ProbeURL
+	}
+	merged.ProbeMode = c.String("probe-mode")
+	if len(merged.ProbeMode) == 0 {
+		merged.ProbeMode = settings.ProbeMode
+	}
+	merged.ProbeExpect = c.String("probe-expect")
+	if len(merged.ProbeExpect) == 0 {
+		merged.ProbeExpect = settings.ProbeExpect
+	}
+	merged.ProbeLocation = c.String("probe-location")
+	if len(merged.ProbeLocation) == 0 {
+		merged.ProbeLocation = settings.ProbeLocation
+	}
+	merged.Interval = c.Int("interval")
+	if merged.Interval == 0 {
+		merged.Interval = settings.Interval
+	}
+	merged.Timeout = c.Int("timeout")
+	if merged.Timeout == 0 {
+		merged.Timeout = settings.Timeout
+	}
+	merged.Retries = c.Int("retries")
+	if merged.Retries == 0 {
+		merged.Retries = settings.Retries
 	}
 	settings = merged
 	logger.Debugf("Settings Username: \"%s\"\n", settings.Username)
@@ -96,6 +160,16 @@ func mergeCliSettings(c *cli.Context) {
 	logger.Debugf("Settings Daemon: %t\n", settings.Daemon)
 	logger.Debugf("Settings Debug: %t\n", settings.Debug)
 	logger.Debugf("Settings AcID: \"%s\"\n", settings.AcID)
+	logger.Debugf("Settings Adapter: \"%s\"\n", settings.Adapter)
+	logger.Debugf("Settings SourceIP: \"%s\"\n", settings.SourceIP)
+	logger.Debugf("Settings DNS: \"%s\"\n", settings.DNS)
+	logger.Debugf("Settings ProbeURL: \"%s\"\n", settings.ProbeURL)
+	logger.Debugf("Settings ProbeMode: \"%s\"\n", settings.ProbeMode)
+	logger.Debugf("Settings ProbeExpect: \"%s\"\n", settings.ProbeExpect)
+	logger.Debugf("Settings ProbeLocation: \"%s\"\n", settings.ProbeLocation)
+	logger.Debugf("Settings Interval: %d\n", settings.Interval)
+	logger.Debugf("Settings Timeout: %d\n", settings.Timeout)
+	logger.Debugf("Settings Retries: %d\n", settings.Retries)
 }
 
 func requestUser() (err error) {
@@ -210,6 +284,117 @@ func cmdDeauth(c *cli.Context) {
 		os.Exit(1)
 	}
 }
+
+const (
+	defaultProbeURL      = libauth.DefaultProbeURL
+	defaultProbeMode     = string(libauth.ProbeHTTP)
+	defaultProbeInterval = 5
+	defaultProbeTimeout  = 5
+	defaultProbeRetries  = 1
+)
+
+// DefaultCampusDNS is the NYIST resolver. It is applied automatically when an
+// interface is bound but no resolver is configured, because a TUN client in
+// fake-ip mode would otherwise answer campus names with 198.18.x.x addresses
+// that are unreachable from the bound campus socket.
+const DefaultCampusDNS = "59.69.128.96"
+
+// networkFromSettings builds the socket binding described by the settings.
+func networkFromSettings() (*libauth.Net, error) {
+	dns := splitList(settings.DNS)
+	if len(dns) == 0 && len(strings.TrimSpace(settings.Adapter)) != 0 {
+		dns = []string{DefaultCampusDNS}
+		logger.Debugf("No DNS configured, using campus resolver %s\n", DefaultCampusDNS)
+	}
+	opts := &libauth.NetworkOptions{
+		Interface: settings.Adapter,
+		SourceIP:  settings.SourceIP,
+		DNS:       dns,
+		Insecure:  settings.Insecure,
+		Timeout:   time.Duration(effectiveTimeout()) * time.Second,
+	}
+	return libauth.NewNet(opts)
+}
+
+func splitList(in string) []string {
+	if strings.TrimSpace(in) == "" {
+		return nil
+	}
+	return strings.FieldsFunc(in, func(r rune) bool {
+		return r == ',' || r == ' ' || r == ';'
+	})
+}
+
+func effectiveInterval() int {
+	if settings.Interval <= 0 {
+		return defaultProbeInterval
+	}
+	return settings.Interval
+}
+
+func effectiveTimeout() int {
+	if settings.Timeout <= 0 {
+		return defaultProbeTimeout
+	}
+	return settings.Timeout
+}
+
+func effectiveRetries() int {
+	if settings.Retries <= 0 {
+		return defaultProbeRetries
+	}
+	return settings.Retries
+}
+
+func probeOptions() (libauth.ProbeOptions, error) {
+	target := settings.ProbeURL
+	if len(target) == 0 {
+		target = defaultProbeURL
+	}
+	mode := strings.ToLower(strings.TrimSpace(settings.ProbeMode))
+	if len(mode) == 0 {
+		mode = defaultProbeMode
+	}
+	if mode != string(libauth.ProbeHTTP) && mode != string(libauth.ProbeTCP) {
+		return libauth.ProbeOptions{}, fmt.Errorf("invalid probe mode %q (want http or tcp)", mode)
+	}
+	codes, err := libauth.ParseStatusList(settings.ProbeExpect)
+	if err != nil {
+		return libauth.ProbeOptions{}, err
+	}
+	return libauth.ProbeOptions{
+		URL:            target,
+		Kind:           libauth.ProbeKind(mode),
+		ExpectStatus:   codes,
+		ExpectLocation: settings.ProbeLocation,
+		Timeout:        time.Duration(effectiveTimeout()) * time.Second,
+	}, nil
+}
+
+func cmdProbe(c *cli.Context) {
+	err := parseSettings(c)
+	if err != nil {
+		logger.Errorf("Parse setting error: %s\n", err)
+		os.Exit(1)
+	}
+	n, err := networkFromSettings()
+	if err != nil {
+		logger.Errorf("Network binding error: %s\n", err)
+		os.Exit(1)
+	}
+	opts, err := probeOptions()
+	if err != nil {
+		logger.Errorf("Probe option error: %s\n", err)
+		os.Exit(1)
+	}
+	logger.Infof("Probe %s using %s\n", opts.URL, n.Description())
+	res := libauth.Probe(n, opts)
+	logger.Infof("%s\n", res.String())
+	if !res.OK {
+		os.Exit(2)
+	}
+}
+
 func cmdKeepalive(c *cli.Context) {
 	err := parseSettings(c)
 	if err != nil {
@@ -241,6 +426,14 @@ func authUtil(c *cli.Context, logout bool) error {
 	}
 
 	host := libauth.NewUrlProvider(domain, settings.Insecure)
+	n, err := networkFromSettings()
+	if err != nil {
+		return fmt.Errorf("network binding: %w", err)
+	}
+	host = host.WithNet(n)
+	if n.Description() != "system routing" {
+		logger.Infof("Network binding: %s\n", n.Description())
+	}
 	if len(settings.Ip) == 0 && !settings.NoCheck {
 		online, _, username := libauth.IsOnline(host, acID)
 		if logout && online {
@@ -286,39 +479,66 @@ func authUtil(c *cli.Context, logout bool) error {
 	return err
 }
 
+// keepAliveLoop probes the campus link and re-authenticates after the session is
+// dropped.
+//
+// The probe deliberately defaults to an HTTP round trip: a TUN based proxy
+// client terminates TCP in user space, so a bare connect() only proves that the
+// tunnel stack answered the SYN (issue #4). Binding the socket to the campus
+// adapter (and resolving names through a campus DNS server when one is
+// configured) makes the probe observe the real link again.
 func keepAliveLoop(c *cli.Context) (ret error) {
-	logger.Infof("Checking connectivity to NYIST Library...")
-
-	checkConnection := func(ip string, port int, timeout time.Duration) error {
-		address := fmt.Sprintf("%s:%d", ip, port)
-		conn, err := net.DialTimeout("tcp", address, timeout)
-		if err != nil {
-			var nErr net.Error
-			if errors.As(err, &nErr) && nErr.Timeout() {
-				return fmt.Errorf("%s timeout", address)
-			}
-			return fmt.Errorf("connect %s error: %v", address, err)
-		}
-		_ = conn.Close()
-		logger.Debugf("connect %s success", address)
-		return nil
+	n, err := networkFromSettings()
+	if err != nil {
+		return fmt.Errorf("network binding: %w", err)
+	}
+	opts, err := probeOptions()
+	if err != nil {
+		return err
 	}
 
-	ip := "122.207.209.6"
-	port := 8080
+	interval := time.Duration(effectiveInterval()) * time.Second
+	retries := effectiveRetries()
 
-	interval := 5 * time.Second // 间隔
+	logger.Infof("Checking connectivity to %s (mode=%s, binding=%s, every %s)\n",
+		opts.URL, opts.Kind, n.Description(), interval)
 
+	failures := 0
 	for {
-		if err := checkConnection(ip, port, 2*time.Second); err != nil {
-			logger.Warningf("Connect %s:%d error: %v", ip, port, err)
-
-			// Authhhhhing!
-			if authErr := authUtil(c, false); authErr != nil {
-				logger.Errorf("auth error: %v", authErr)
+		res := libauth.Probe(n, opts)
+		if res.OK {
+			if failures > 0 {
+				logger.Infof("Connectivity restored: %s\n", res.String())
+			}
+			failures = 0
+			logger.Debugf("Probe success: %s\n", res.String())
+		} else {
+			failures++
+			logger.Warningf("Probe failed (%d/%d): %s\n", failures, retries, res.String())
+			if failures >= retries {
+				failures = 0
+				// Authhhhhing!
+				if authErr := authUtil(c, false); authErr != nil {
+					logger.Errorf("auth error: %v\n", authErr)
+				}
 			}
 		}
 		time.Sleep(interval)
+	}
+}
+
+// probeFlagSet returns a fresh flag set for the probe/keepalive commands.
+// Each command needs its own values, so the flags are built per call.
+func probeFlagSet() []cli.Flag {
+	return []cli.Flag{
+		&cli.StringFlag{Name: "url", Usage: "probe target `url` or host:port, default " + defaultProbeURL},
+		&cli.StringFlag{Name: "probe-url", Usage: "alias of --url"},
+		&cli.StringFlag{Name: "probe-mode", Usage: "probe mode: http (default, one round trip) or tcp (handshake only)"},
+		&cli.StringFlag{Name: "probe-expect", Usage: "comma separated accepted HTTP status `codes`, e.g. 200,302"},
+		&cli.StringFlag{Name: "probe-location", Usage: "require this substring in the probe redirect Location `header`"},
+		&cli.IntFlag{Name: "interval", Usage: "seconds between keepalive probes"},
+		&cli.IntFlag{Name: "timeout", Usage: "per-probe `timeout` in seconds"},
+		&cli.IntFlag{Name: "retries", Usage: "consecutive probe failures before re-authenticating"},
 	}
 }
 
@@ -328,7 +548,8 @@ func main() {
 		UsageText: `auth-nyist [options]
 	 auth-nyist [options] auth [auth_options]
 	 auth-nyist [options] deauth [auth_options]
-	 auth-nyist [options] online [online_options]`,
+	 auth-nyist [options] keepalive [keepalive_options]
+	 auth-nyist [options] probe [probe_options]`,
 		Usage:    "Authenticating utility for NYIST",
 		Version:  "2.0.0",
 		HideHelp: true,
@@ -339,6 +560,12 @@ func main() {
 			&cli.StringFlag{Name: "hook-success", Usage: "command line to be executed in shell after successful login/out"},
 			&cli.BoolFlag{Name: "daemonize, D", Usage: "run without reading username/password from standard input; less log"},
 			&cli.BoolFlag{Name: "debug", Usage: "print debug messages"},
+			&cli.StringFlag{Name: "interface, i", Usage: "bind every socket to this network `name` (e.g. wlan0, WLAN, en0; auto = default-route adapter)"},
+			&cli.StringFlag{Name: "source-ip", Usage: "pin this local source `ip` instead of deriving it from --interface"},
+			&cli.StringFlag{Name: "dns", Usage: "comma separated resolver `servers`, e.g. 59.69.128.96"},
+			&cli.BoolFlag{Name: "insecure", Usage: "skip TLS certificate verification"},
+			&cli.BoolFlag{Name: "ipv6", Usage: "use the IPv6 portal address"},
+			&cli.StringFlag{Name: "ac-id", Usage: "ac_id to send to the portal"},
 			&cli.BoolFlag{Name: "help, h", Usage: "print the help"},
 		},
 		Commands: []cli.Command{
@@ -358,8 +585,15 @@ func main() {
 			},
 			{
 				Name:   "keepalive",
-				Usage:  "Keep the connection alive by pinging a server",
+				Usage:  "Keep the connection alive by probing a server through the campus adapter",
+				Flags:  probeFlagSet(),
 				Action: cmdKeepalive,
+			},
+			{
+				Name:   "probe",
+				Usage:  "Probe the campus link once and report the result",
+				Flags:  probeFlagSet(),
+				Action: cmdProbe,
 			},
 		},
 	}
