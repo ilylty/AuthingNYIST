@@ -105,15 +105,15 @@ func TestDefaultIdentityOnAprilFools(t *testing.T) {
 	if got.OS == DefaultOS && got.Name == DefaultDeviceName {
 		t.Fatalf("April 1st with the egg enabled should change the identity, got %+v", got)
 	}
-	if strings.TrimSpace(got.OS) == "" || strings.TrimSpace(got.Name) == "" {
+	// os and name share one list, so the portal sees a single coherent device.
+	if got.OS != got.Name {
+		t.Fatalf("os and name must match, got os=%q name=%q", got.OS, got.Name)
+	}
+	if strings.TrimSpace(got.OS) == "" {
 		t.Fatalf("egg identity must not be empty, got %+v", got)
 	}
-	// Both fields come from the same draw, so they must be real list entries.
-	if !containsString(aprilFoolsOS, got.OS) {
-		t.Errorf("os %q is not from the egg list", got.OS)
-	}
-	if !containsString(aprilFoolsName, got.Name) {
-		t.Errorf("name %q is not from the egg list", got.Name)
+	if !containsString(aprilFoolsDevices, got.OS) {
+		t.Errorf("device %q is not from the egg list", got.OS)
 	}
 }
 
@@ -141,9 +141,29 @@ func TestAprilFoolsIdentityIsDeterministic(t *testing.T) {
 	if a != b {
 		t.Fatalf("same seed must produce the same identity: %+v vs %+v", a, b)
 	}
+	if a.OS != a.Name {
+		t.Fatalf("egg identity must use one value for both fields, got %+v", a)
+	}
+}
+
+// TestExplicitOSOnlyKeepsNameInSync documents the partial-override case: naming
+// only the device still shows a coherent (matching) pair.
+func TestExplicitOSOnlyKeepsNameInSync(t *testing.T) {
+	when := time.Date(2026, time.April, 1, 9, 0, 0, 0, time.Local)
+	got := DefaultIdentity(when, ClientIdentity{OS: "OpenBSD 7.6"}, true)
+	if got.OS != "OpenBSD 7.6" {
+		t.Fatalf("explicit os must win, got %+v", got)
+	}
+	if !containsString(aprilFoolsDevices, got.Name) {
+		t.Fatalf("unset name should take the egg device, got %q", got.Name)
+	}
 }
 
 func TestClientIdentityString(t *testing.T) {
+	same := ClientIdentity{OS: "abc", Name: "abc"}.String()
+	if same != `"abc"` {
+		t.Fatalf("a matching pair should render once, got %s", same)
+	}
 	got := ClientIdentity{OS: "abc", Name: "def"}.String()
 	if !strings.Contains(got, `os="abc"`) || !strings.Contains(got, `name="def"`) {
 		t.Fatalf("unexpected rendering: %s", got)
