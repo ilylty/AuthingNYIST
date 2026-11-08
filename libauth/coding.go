@@ -103,6 +103,15 @@ func XEncode(str, key string) *string {
 	}
 	v := S(str, true)
 	k := S(key, false)
+	// The XXTEA rounds index k with (p&3)^e, so the key schedule needs four
+	// words. A real SRun challenge is 64 hex characters (16 words) and always
+	// satisfies this; a short or empty key used to panic with an index out of
+	// range instead of returning an error.
+	if len(k) < 4 {
+		padded := make([]uint32, 4)
+		copy(padded, k)
+		k = padded
+	}
 	n := len(v) - 1
 	z := v[n]
 	y := v[0]

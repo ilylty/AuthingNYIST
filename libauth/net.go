@@ -380,6 +380,12 @@ func localAddrFor(network, address string, src net.IP) net.Addr {
 	if want4 != is4 {
 		return nil
 	}
+	// net.Dialer rejects a *net.TCPAddr for a UDP dial with "mismatched local
+	// address type", so pick the type from the network. DNS queries go over UDP
+	// and hit exactly that path.
+	if strings.HasPrefix(network, "udp") {
+		return &net.UDPAddr{IP: src}
+	}
 	return &net.TCPAddr{IP: src}
 }
 

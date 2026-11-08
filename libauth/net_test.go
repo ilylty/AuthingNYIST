@@ -44,11 +44,30 @@ func TestLocalAddrFor(t *testing.T) {
 		{"tcp", "[2001:da8::5]:443", v6, true},
 		{"tcp4", "[2001:da8::5]:443", v6, false},
 		{"tcp6", "122.207.209.6:80", v4, false},
+		// DNS goes over UDP; net.Dialer rejects a TCP local address there.
+		{"udp4", "59.69.128.96:53", v4, true},
+		{"udp", "59.69.128.96:53", v4, true},
+		{"udp", "[2001:da8::5]:53", v4, false},
 	}
 	for _, c := range cases {
 		got := localAddrFor(c.network, c.address, c.src)
 		if (got != nil) != c.want {
 			t.Errorf("localAddrFor(%q, %q, %s) = %v, want non-nil=%v", c.network, c.address, c.src, got, c.want)
+			continue
+		}
+		if got == nil {
+			continue
+		}
+		// The concrete type has to match the network family, otherwise the dial
+		// fails with "mismatched local address type".
+		if strings.HasPrefix(c.network, "udp") {
+			if _, ok := got.(*net.UDPAddr); !ok {
+				t.Errorf("localAddrFor(%q, ...) returned %T, want *net.UDPAddr", c.network, got)
+			}
+		} else {
+			if _, ok := got.(*net.TCPAddr); !ok {
+				t.Errorf("localAddrFor(%q, ...) returned %T, want *net.TCPAddr", c.network, got)
+			}
 		}
 	}
 }

@@ -55,6 +55,13 @@ type Settings struct {
 	Timeout int `json:"timeout"`
 	// Retries is how many consecutive probe failures trigger a re-auth.
 	Retries int `json:"retries"`
+	// OS is the os parameter of the SRun login request, shown in the portal's
+	// device list. Empty selects "auth-nyist-cli".
+	OS string `json:"os"`
+	// DeviceName is the name parameter, reported next to os.
+	DeviceName string `json:"name"`
+	// NoEgg disables the April 1st device-name egg.
+	NoEgg bool `json:"noEgg"`
 }
 
 var logger = loggo.GetLogger("auth-nyist")
@@ -151,6 +158,15 @@ func mergeCliSettings(c *cli.Context) {
 	if merged.Retries == 0 {
 		merged.Retries = settings.Retries
 	}
+	merged.OS = c.GlobalString("os")
+	if len(merged.OS) == 0 {
+		merged.OS = settings.OS
+	}
+	merged.DeviceName = c.GlobalString("device-name")
+	if len(merged.DeviceName) == 0 {
+		merged.DeviceName = settings.DeviceName
+	}
+	merged.NoEgg = settings.NoEgg || c.GlobalBool("no-egg")
 	settings = merged
 	logger.Debugf("Settings Username: \"%s\"\n", settings.Username)
 	logger.Debugf("Settings Ip: \"%s\"\n", settings.Ip)
@@ -174,6 +190,9 @@ func mergeCliSettings(c *cli.Context) {
 	logger.Debugf("Settings Interval: %d\n", settings.Interval)
 	logger.Debugf("Settings Timeout: %d\n", settings.Timeout)
 	logger.Debugf("Settings Retries: %d\n", settings.Retries)
+	logger.Debugf("Settings OS: \"%s\"\n", settings.OS)
+	logger.Debugf("Settings DeviceName: \"%s\"\n", settings.DeviceName)
+	logger.Debugf("Settings NoEgg: %t\n", settings.NoEgg)
 }
 
 func requestUser() (err error) {
@@ -463,7 +482,18 @@ func authUtil(c *cli.Context, logout bool) error {
 		}
 	}
 
-	err = libauth.LoginLogout(settings.Username, settings.Password, host, logout, settings.Ip, acID)
+	identity := libauth.DefaultIdentity(time.Now(), libauth.ClientIdentity{
+		OS:   settings.OS,
+		Name: settings.DeviceName,
+	}, !settings.NoEgg)
+	if identity.OS != libauth.DefaultOS || identity.Name != libauth.DefaultDeviceName {
+		logger.Debugf("Reporting device identity: %s\n", identity.String())
+		if libauth.IsAprilFools(time.Now()) && !settings.NoEgg {
+			logger.Infof("4 月 1 日彩蛋：向门户上报设备 %s\n", identity.String())
+		}
+	}
+
+	err = libauth.LoginLogoutWithIdentity(settings.Username, settings.Password, host, logout, settings.Ip, acID, identity)
 	action := "Login"
 	if logout {
 		action = "Logout"
@@ -594,6 +624,9 @@ func main() {
 			&cli.StringFlag{Name: "source-ip", Usage: "pin this local source `ip` instead of deriving it from --interface"},
 			&cli.StringFlag{Name: "dns", Usage: "comma separated resolver `servers`, e.g. 59.69.128.96"},
 			&cli.BoolFlag{Name: "strict-interface", Usage: "fail instead of degrading when --interface is unavailable"},
+			&cli.StringFlag{Name: "os", Usage: "`os` parameter reported to the portal, default " + libauth.DefaultOS},
+			&cli.StringFlag{Name: "device-name", Usage: "device `name` parameter reported to the portal, default " + libauth.DefaultDeviceName},
+			&cli.BoolFlag{Name: "no-egg", Usage: "disable the April 1st device-name egg"},
 			&cli.BoolFlag{Name: "insecure", Usage: "skip TLS certificate verification"},
 			&cli.BoolFlag{Name: "ipv6", Usage: "use the IPv6 portal address"},
 			&cli.StringFlag{Name: "ac-id", Usage: "ac_id to send to the portal"},

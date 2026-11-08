@@ -44,6 +44,10 @@ GLOBAL OPTIONS:
    --source-ip ip                    pin this local source ip instead of deriving it from --interface
    --dns servers                     comma separated resolver servers, e.g. 59.69.128.96
    --insecure                        skip TLS certificate verification
+   --strict-interface                fail instead of degrading when --interface is unavailable
+   --os os                           os parameter reported to the portal, default auth-nyist-cli
+   --device-name name                device name parameter reported to the portal, default auth-nyist-cli
+   --no-egg                          disable the April 1st device-name egg
    --help, -h                        print the help
    --version, -v                     print the version
 ```
@@ -73,7 +77,10 @@ Write a config file to store your username & password or other options in the fo
   "probeLocation": "",
   "interval": 5,
   "timeout": 5,
-  "retries": 1
+  "retries": 1,
+  "os": "auth-nyist-cli",
+  "name": "auth-nyist-cli",
+  "noEgg": false
 }
 ```
 
@@ -159,6 +166,18 @@ auth-nyist keepalive --url http://122.207.209.6:8080/ --interval 10 --retries 2
 ```
 
 `probe` exits with status 2 when the probe fails, which makes it usable from cron or a health check.
+
+### Reported device name (`os` / `name`)
+
+The SRun login request carries two free-form parameters, `os` and `name`, which the portal stores and shows in its device list. Neither is part of `chksum`, so any value is accepted.
+
+```shell
+auth-nyist --os "Windows 11" --device-name "home-pc" auth
+```
+
+Defaults to `auth-nyist-cli` for both, matching the User-Agent this tool sends. Configure with `"os"` / `"name"`, override with `--os` / `--device-name`.
+
+**April 1st egg.** On April 1st the defaults are replaced by a random pair from a small list (`"Windows 7 旗舰版 已激活"`, `"不想996"`, `"图书馆馆长"`, …), so the portal's device list fills up with something silly. The egg follows the local date, and an explicitly passed `--os`/`--device-name` always wins over it. Disable it with `--no-egg` or `"noEgg": true`.
 
 ## Autostart
 

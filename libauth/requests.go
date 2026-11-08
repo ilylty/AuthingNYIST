@@ -28,6 +28,35 @@ func extractJSONFromJSONP(jsonp, callbackName string) (string, error) {
 	return jsonp[l+1 : len(jsonp)-1], nil
 }
 
+// DefaultOS is the os parameter sent with the login request. The SRun portal
+// records it in its online table and accepts any value; auth-nyist-cli matches
+// the User-Agent this tool already sends.
+const DefaultOS = "auth-nyist-cli"
+
+// DefaultDeviceName is the name parameter, reported to the portal alongside os.
+const DefaultDeviceName = "auth-nyist-cli"
+
+// ClientIdentity carries the os and name parameters of the SRun login request.
+// The portal shows them in its device list and does not validate them, but some
+// deployments inspect them (a campus that expects a real client name).
+type ClientIdentity struct {
+	// OS is the os parameter. Empty selects DefaultOS.
+	OS string
+	// Name is the name parameter. Empty selects DefaultDeviceName.
+	Name string
+}
+
+// Resolve fills the defaults, so callers can pass a zero value confidently.
+func (c ClientIdentity) Resolve() ClientIdentity {
+	if strings.TrimSpace(c.OS) == "" {
+		c.OS = DefaultOS
+	}
+	if strings.TrimSpace(c.Name) == "" {
+		c.Name = DefaultDeviceName
+	}
+	return c
+}
+
 func buildChallengeParams(username string, anotherIP string) url.Values {
 
 	challParams := url.Values{
@@ -40,6 +69,14 @@ func buildChallengeParams(username string, anotherIP string) url.Values {
 }
 
 func buildLoginParams(username, password, token string, logout bool, anotherIP string, acID string) (loginParams url.Values, err error) {
+	return buildLoginParamsWithIdentity(username, password, token, logout, anotherIP, acID, ClientIdentity{})
+}
+
+// buildLoginParamsWithIdentity is buildLoginParams plus the os and name
+// parameters. os and name are not part of chksum, so adding them does not
+// change the signature.
+func buildLoginParamsWithIdentity(username, password, token string, logout bool, anotherIP string, acID string, identity ClientIdentity) (loginParams url.Values, err error) {
+	identity = identity.Resolve()
 	ip := anotherIP
 	hmd5 := fmt.Sprintf("%032x", md5.Sum([]byte(password)))
 
@@ -65,6 +102,8 @@ func buildLoginParams(username, password, token string, logout bool, anotherIP s
 		"ip":           []string{ip},
 		"double_stack": []string{"1"},
 		"username":     []string{username},
+		"os":           []string{identity.OS},
+		"name":         []string{identity.Name},
 	}
 	if !logout {
 		loginParams.Add("password", "{MD5}"+hmd5)
@@ -169,6 +208,12 @@ func IsOnline(host *UrlProvider, acID string) (online bool, err error, username 
 }
 
 func LoginLogout(username, password string, host *UrlProvider, logout bool, anotherIP string, acID string) (err error) {
+	return LoginLogoutWithIdentity(username, password, host, logout, anotherIP, acID, ClientIdentity{})
+}
+
+// LoginLogoutWithIdentity performs login or logout, reporting identity.OS and
+// identity.Name to the portal through the os and name query parameters.
+func LoginLogoutWithIdentity(username, password string, host *UrlProvider, logout bool, anotherIP string, acID string, identity ClientIdentity) (err error) {
 	logger.Debugf("Getting challenge...\n")
 	body, err := GetJSONWithNet(host.net, host.ChallengeUriBase(), buildChallengeParams(username, anotherIP), loginTimeout(host))
 	if err != nil {
@@ -192,7 +237,7 @@ func LoginLogout(username, password string, host *UrlProvider, logout bool, anot
 		return
 	}
 
-	loginParams, err := buildLoginParams(username, password, token, logout, anotherIP, acID)
+	loginParams, err := buildLoginParamsWithIdentity(username, password, token, logout, anotherIP, acID, identity)
 	if err != nil {
 		return
 	}
