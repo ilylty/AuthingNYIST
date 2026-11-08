@@ -103,6 +103,23 @@ func TestParseStatusList(t *testing.T) {
 
 // TestProbeHTTPDetectsClosedPort is the regression test for issue #4. An open
 // port answers the probe, a closed port must not.
+func TestHtonl(t *testing.T) {
+	cases := map[uint32]uint32{
+		0x0000000a: 0x0a000000, // interface index 10 -> 0A 00 00 00
+		0x00000001: 0x01000000,
+		0x01020304: 0x04030201,
+		0x00000000: 0x00000000,
+	}
+	for in, want := range cases {
+		if got := htonl(in); got != want {
+			t.Errorf("htonl(0x%08x) = 0x%08x, want 0x%08x", in, got, want)
+		}
+	}
+	if htonl(htonl(0x12345678)) != 0x12345678 {
+		t.Error("htonl must be its own inverse")
+	}
+}
+
 func TestNilNetFollowsSystemRouting(t *testing.T) {
 	var n *Net
 	if got := n.Description(); got != "system routing" {

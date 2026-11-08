@@ -29,7 +29,3 @@ func socketControl(ifName string, ifIndex int) func(network, address string, c s
 
 // deviceBindNeedsPrivilege reports that IP_UNICAST_IF needs no privilege.
 func deviceBindNeedsPrivilege() bool { return false }
-
-func htonl(v uint32) uint32 {
-	return v<<24&0xff000000 | v<<8&0x00ff0000 | v>>8&0x0000ff00 | v>>24&0x000000ff
-}

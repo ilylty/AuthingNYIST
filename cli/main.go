@@ -469,7 +469,10 @@ func authUtil(c *cli.Context, logout bool) error {
 		if settings.KeepOn {
 			if len(settings.Ip) != 0 {
 				logger.Errorf("Cannot keep another IP online\n")
-			} else {
+			} else if !keepAliveActive {
+				// Only start the loop from the top level. keepAliveLoop calls
+				// authUtil on every probe failure, so starting a second loop
+				// there would nest one loop per recovery attempt.
 				return keepAliveLoop(c)
 			}
 		}
@@ -478,6 +481,10 @@ func authUtil(c *cli.Context, logout bool) error {
 	}
 	return err
 }
+
+// keepAliveActive guards against nesting keepAliveLoop inside itself, which
+// happens when keepOnline is set and a probe failure triggers authUtil.
+var keepAliveActive bool
 
 // keepAliveLoop probes the campus link and re-authenticates after the session is
 // dropped.
@@ -496,6 +503,9 @@ func keepAliveLoop(c *cli.Context) (ret error) {
 	if err != nil {
 		return err
 	}
+
+	keepAliveActive = true
+	defer func() { keepAliveActive = false }()
 
 	interval := time.Duration(effectiveInterval()) * time.Second
 	retries := effectiveRetries()
