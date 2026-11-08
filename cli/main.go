@@ -36,6 +36,8 @@ type Settings struct {
 	Adapter string `json:"adapter"`
 	// SourceIP overrides the address derived from Adapter.
 	SourceIP string `json:"sourceIp"`
+	// Strict fails instead of degrading when Adapter is unavailable.
+	Strict bool `json:"strictInterface"`
 	// DNS lists campus resolvers used instead of the system resolver, so a
 	// fake-ip TUN resolver cannot answer campus names.
 	DNS string `json:"dns"`
@@ -117,6 +119,7 @@ func mergeCliSettings(c *cli.Context) {
 	if len(merged.DNS) == 0 {
 		merged.DNS = settings.DNS
 	}
+	merged.Strict = settings.Strict || c.GlobalBool("strict-interface")
 	merged.ProbeURL = c.String("probe-url")
 	if len(merged.ProbeURL) == 0 {
 		merged.ProbeURL = c.String("url")
@@ -163,6 +166,7 @@ func mergeCliSettings(c *cli.Context) {
 	logger.Debugf("Settings Adapter: \"%s\"\n", settings.Adapter)
 	logger.Debugf("Settings SourceIP: \"%s\"\n", settings.SourceIP)
 	logger.Debugf("Settings DNS: \"%s\"\n", settings.DNS)
+	logger.Debugf("Settings Strict: %t\n", settings.Strict)
 	logger.Debugf("Settings ProbeURL: \"%s\"\n", settings.ProbeURL)
 	logger.Debugf("Settings ProbeMode: \"%s\"\n", settings.ProbeMode)
 	logger.Debugf("Settings ProbeExpect: \"%s\"\n", settings.ProbeExpect)
@@ -311,6 +315,7 @@ func networkFromSettings() (*libauth.Net, error) {
 		SourceIP:  settings.SourceIP,
 		DNS:       dns,
 		Insecure:  settings.Insecure,
+		Strict:    settings.Strict,
 		Timeout:   time.Duration(effectiveTimeout()) * time.Second,
 	}
 	return libauth.NewNet(opts)
@@ -512,9 +517,24 @@ func keepAliveLoop(c *cli.Context) (ret error) {
 
 	logger.Infof("Checking connectivity to %s (mode=%s, binding=%s, every %s)\n",
 		opts.URL, opts.Kind, n.Description(), interval)
+	if reason := n.DegradedReason(); reason != "" {
+		logger.Warningf("Adapter %s is unavailable; the binding degrades until it returns\n", reason)
+	}
 
 	failures := 0
 	for {
+		// A degraded binding is temporary: Wi-Fi may associate later. Rebuild it
+		// as soon as the requested adapter is usable again so the probe goes back
+		// to observing the campus link instead of the system route.
+		if !n.Healthy() {
+			if fresh, rebindErr := networkFromSettings(); rebindErr == nil {
+				if fresh.Healthy() {
+					logger.Infof("Binding restored: %s\n", fresh.Description())
+					n = fresh
+				}
+			}
+		}
+
 		res := libauth.Probe(n, opts)
 		if res.OK {
 			if failures > 0 {
@@ -561,7 +581,7 @@ func main() {
 	 auth-nyist [options] keepalive [keepalive_options]
 	 auth-nyist [options] probe [probe_options]`,
 		Usage:    "Authenticating utility for NYIST",
-		Version:  "2.0.0",
+		Version:  "2.3.0",
 		HideHelp: true,
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "username, u", Usage: "your portal account `name`"},
@@ -573,6 +593,7 @@ func main() {
 			&cli.StringFlag{Name: "interface, i", Usage: "bind every socket to this network `name` (e.g. wlan0, WLAN, en0; auto = default-route adapter)"},
 			&cli.StringFlag{Name: "source-ip", Usage: "pin this local source `ip` instead of deriving it from --interface"},
 			&cli.StringFlag{Name: "dns", Usage: "comma separated resolver `servers`, e.g. 59.69.128.96"},
+			&cli.BoolFlag{Name: "strict-interface", Usage: "fail instead of degrading when --interface is unavailable"},
 			&cli.BoolFlag{Name: "insecure", Usage: "skip TLS certificate verification"},
 			&cli.BoolFlag{Name: "ipv6", Usage: "use the IPv6 portal address"},
 			&cli.StringFlag{Name: "ac-id", Usage: "ac_id to send to the portal"},

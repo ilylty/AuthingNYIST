@@ -25,7 +25,7 @@ USAGE:
    auth-nyist [options] probe [probe_options]
 
 VERSION:
-   2.0.0
+   2.3.0
 
 COMMANDS:
      auth       (default) Auth via auth.nyist.edu.cn
@@ -88,6 +88,7 @@ If a proxy client owns the default route through a TUN interface (Hiddify, Clash
 | `adapter` | Interface every socket is bound to. `auto` picks the wireless adapter that owns the default route, skipping `tun*`/`utun*`/`Meta` and container bridges. `wlan0`, `WLAN`, `en0` … also work. |
 | `sourceIp` | Local source address. Derived from `adapter` when empty; set it only when an adapter holds several addresses. |
 | `dns` | Resolvers used instead of the system resolver, e.g. `59.69.128.96`. Applied automatically (with `59.69.128.96`) whenever `adapter` is set and this key is empty, because a proxy in `fake-ip` mode otherwise resolves campus names to `198.18.x.x`, which are unreachable from the bound campus socket. |
+| `strictInterface` | Fail instead of degrading when `adapter` is unavailable. Without it the binding degrades and recovers on its own, which is what a service should do. |
 
 Binding behaviour per platform:
 
@@ -95,6 +96,25 @@ Binding behaviour per platform:
 - Windows: `IP_UNICAST_IF` with the interface index in network byte order, plus the source address.
 - macOS: `IP_BOUND_IF` plus the source address.
 - Other platforms: source address pinning only.
+
+### Missing adapter
+
+A named adapter is not guaranteed to exist: a module can start before Wi-Fi associates, and a laptop changes adapters between networks. The binding therefore degrades instead of aborting:
+
+1. the requested adapter, when it exists and holds a global IPv4 address;
+2. auto detection, which prefers the wireless adapter owning a default route and skips `tun*`/`utun*`/`Meta` and container bridges;
+3. no binding at all (system routing).
+
+`keepalive` rebuilds the binding every round, so it returns to the adapter as soon as it reappears. The log reports the state:
+
+```
+WARNING Interface "wlan0" unavailable (route ip+net: no such network interface)
+WARNING No usable campus interface (...); falling back to system routing
+INFO    Checking connectivity to 122.207.209.6:8080 (mode=tcp, binding=system routing (degraded from wlan0 (not found)), every 5s)
+INFO    Binding restored: interface=wlan0 source=10.2.41.236 dns=59.69.128.96:53
+```
+
+A binding also degrades when the adapter keeps its name but changes its address, because a pinned source address that no longer exists makes every dial fail. Pass `--strict-interface` (or `"strictInterface": true`) to turn the fallback into a hard error instead, which is what a one-shot script or a CI check wants.
 
 Check the result before trusting a keepalive loop:
 
@@ -122,8 +142,14 @@ A minimal configuration for the TUN case is therefore:
 A TUN client terminates TCP in user space: it answers the SYN itself and opens the upstream connection afterwards. A successful `connect()` therefore proves only that the tunnel stack replied, never that the upstream host is reachable (issue #4). The probe defaults to `http` for that reason.
 
 - `probeMode: "http"` (default) requires a complete HTTP response. With `probeExpect`/`probeLocation` you can pin the expected answer, for example `"probeExpect": "302"` with `"probeLocation": "/opac/search/simsearch"` for the NYIST library.
-- `probeMode: "tcp"` keeps the old handshake-only check. It is cheap and correct only when the probe is bound to the campus adapter.
+- `probeMode: "tcp"` keeps the old handshake-only check. It is cheap and correct **only when the probe is bound to the campus adapter**, where a completed handshake reflects the real link. Unbound, it is the false-positive described above.
 - `interval` is the probe period in seconds, `timeout` the per-probe budget, and `retries` how many consecutive failures trigger a re-authentication.
+
+A bound `tcp` probe is the cheapest correct configuration, since it needs one round trip instead of two:
+
+```shell
+auth-nyist -i wlan0 --dns 59.69.128.96 probe --probe-mode tcp --url 122.207.209.6:8080
+```
 
 Tuning the probe from the command line:
 

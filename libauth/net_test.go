@@ -213,11 +213,65 @@ func TestProbeTCP(t *testing.T) {
 	}
 }
 
-func TestNewNetRejectsUnknownInterface(t *testing.T) {
-	_, err := NewNet(&NetworkOptions{Interface: "definitely-not-an-interface-0"})
-	if err == nil {
-		t.Fatal("expected an error for an unknown interface")
+// TestNewNetDegradesOnUnknownInterface covers the daemon case: a missing
+// adapter must not abort the process, it degrades to another adapter or to
+// system routing and reports why.
+func TestNewNetDegradesOnUnknownInterface(t *testing.T) {
+	n, err := NewNet(&NetworkOptions{Interface: "definitely-not-an-interface-0"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	if n.DegradedReason() == "" {
+		t.Fatal("expected the binding to report a degraded reason")
+	}
+	if n.Requested != "definitely-not-an-interface-0" {
+		t.Fatalf("Requested = %q", n.Requested)
+	}
+	desc := n.Description()
+	if !strings.Contains(desc, "degraded from") {
+		t.Fatalf("description should mention the degradation, got %q", desc)
+	}
+}
+
+// TestNewNetStrictRejectsUnknownInterface is the opposite contract: with Strict
+// the caller wants a hard failure instead of a silent fallback.
+func TestNewNetStrictRejectsUnknownInterface(t *testing.T) {
+	_, err := NewNet(&NetworkOptions{Interface: "definitely-not-an-interface-0", Strict: true})
+	if err == nil {
+		t.Fatal("expected an error for an unknown interface in strict mode")
+	}
+}
+
+func TestNewNetStrictRejectsNetworkLessInterface(t *testing.T) {
+	// The loopback adapter never carries a global IPv4 address.
+	_, err := NewNet(&NetworkOptions{Interface: "lo", Strict: true})
+	if err == nil {
+		t.Fatal("expected an error for an interface without a global IPv4 address")
+	}
+}
+
+// TestNetHealthyAfterLocalInterface checks the happy path with a real local
+// adapter, so a degraded result cannot be mistaken for success.
+func TestNetHealthyAfterLocalInterface(t *testing.T) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("interfaces: %v", err)
+	}
+	for i := range ifaces {
+		iface := &ifaces[i]
+		if iface.Flags&net.FlagLoopback != 0 || !hasGlobalIPv4(iface) || isTunnelInterface(iface.Name) {
+			continue
+		}
+		n, err := NewNet(&NetworkOptions{Interface: iface.Name, Strict: true})
+		if err != nil {
+			t.Fatalf("binding %q: %v", iface.Name, err)
+		}
+		if !n.Healthy() {
+			t.Fatalf("%q should report a healthy binding, got %q", iface.Name, n.DegradedReason())
+		}
+		return
+	}
+	t.Skip("no non-tunnel adapter with a global IPv4 address")
 }
 
 func TestNewNetRejectsBadSourceIP(t *testing.T) {

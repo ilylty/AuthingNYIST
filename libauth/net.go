@@ -44,6 +44,10 @@ type NetworkOptions struct {
 	// Insecure disables TLS certificate verification. The portal of some
 	// deployments answers with a self-signed or mismatched certificate.
 	Insecure bool
+	// Strict fails instead of degrading when Interface is missing or holds no
+	// global IPv4 address. Without it the binding falls back to auto detection
+	// and then to system routing, so a daemon survives a disappearing adapter.
+	Strict bool
 	// Timeout bounds a single dial. Zero selects DefaultNetworkTimeout.
 	Timeout time.Duration
 }
@@ -72,6 +76,12 @@ type Net struct {
 	Interface   *net.Interface
 	SourceIP    net.IP
 	DeviceBound bool
+	// Requested is the adapter name the caller asked for, kept even when the
+	// binding degraded, so logs and Healthy can report the intent.
+	Requested string
+	// Missing is non-empty when the requested adapter was unavailable and the
+	// binding degraded to another adapter or to system routing.
+	Missing string
 
 	dialer    *dialer
 	warned    map[string]struct{}
@@ -94,30 +104,26 @@ func NewNet(opts *NetworkOptions) (*Net, error) {
 	}
 
 	name := strings.TrimSpace(n.Options.Interface)
-	if strings.EqualFold(name, AutomaticInterface) {
-		detected, err := detectCampusInterface()
-		if err != nil {
-			return nil, fmt.Errorf("auto-detect interface: %w", err)
-		}
-		logger.Infof("Auto-detected interface %q", detected)
-		name = detected
-	}
-	n.Options.Interface = name
+	n.Requested = name
 
-	if name != "" {
-		iface, err := net.InterfaceByName(name)
-		if err != nil {
-			return nil, fmt.Errorf("find interface %q: %w", name, err)
-		}
-		n.Interface = iface
+	iface, degraded, err := resolveInterface(name, n.Options.Strict)
+	if err != nil {
+		return nil, err
+	}
+	n.Missing = degraded
+	n.Interface = iface
+	if iface != nil {
+		n.Options.Interface = iface.Name
 		if n.Options.SourceIP == "" {
-			ip, err := InterfaceIPv4(iface)
-			if err != nil {
-				logger.Warningf("Interface %s has no global IPv4 address: %v", iface.Name, err)
+			ip, ipErr := InterfaceIPv4(iface)
+			if ipErr != nil {
+				logger.Warningf("Interface %s has no global IPv4 address: %v", iface.Name, ipErr)
 			} else {
 				n.Options.SourceIP = ip.String()
 			}
 		}
+	} else {
+		n.Options.Interface = ""
 	}
 
 	if n.Options.SourceIP != "" {
@@ -153,6 +159,133 @@ func NewNet(opts *NetworkOptions) (*Net, error) {
 	return n, nil
 }
 
+// resolveInterface turns a requested adapter name into a usable interface.
+//
+// The three levels are: the requested adapter itself, auto detection (the
+// wireless adapter that owns a default route, skipping tunnel and bridge
+// devices), and finally no binding at all (system routing). The last level
+// keeps a daemon alive when Wi-Fi is gone, which is why the previous failure
+// mode — exiting with "find interface" — was wrong for a service.
+//
+// degraded is non-empty when the request could not be honoured; it names what
+// was lost so the caller can log it once.
+func resolveInterface(name string, strict bool) (iface *net.Interface, degraded string, err error) {
+	auto := strings.EqualFold(name, AutomaticInterface)
+
+	if name != "" && !auto {
+		candidate, lookupErr := net.InterfaceByName(name)
+		switch {
+		case lookupErr == nil && hasGlobalIPv4(candidate):
+			return candidate, "", nil
+		case lookupErr == nil:
+			// The adapter exists but has no address yet (Wi-Fi still
+			// associating, DHCP pending). Binding to it would only produce
+			// dial failures, so degrade.
+			if strict {
+				return nil, "", fmt.Errorf("interface %q has no global IPv4 address", name)
+			}
+			logger.Warningf("Interface %q has no global IPv4 address yet", name)
+			degraded = fmt.Sprintf("%s (no IPv4 address)", name)
+		default:
+			if strict {
+				return nil, "", fmt.Errorf("find interface %q: %w", name, lookupErr)
+			}
+			logger.Warningf("Interface %q unavailable (%v)", name, lookupErr)
+			degraded = fmt.Sprintf("%s (not found)", name)
+		}
+	}
+
+	detected, detectErr := detectCampusInterface()
+	if detectErr == nil {
+		if detected == name {
+			// Detection only confirmed the adapter the caller named.
+			return nil, degraded, detectErr
+		}
+		candidate, lookupErr := net.InterfaceByName(detected)
+		if lookupErr == nil && hasGlobalIPv4(candidate) {
+			if name != "" {
+				logger.Warningf("Falling back to auto-detected interface %q", detected)
+			} else {
+				logger.Infof("Auto-detected interface %q", detected)
+			}
+			return candidate, degraded, nil
+		}
+	}
+
+	if strict {
+		if name == "" || auto {
+			return nil, degraded, fmt.Errorf("auto-detect interface: %w", detectErr)
+		}
+		return nil, degraded, fmt.Errorf("interface %q unavailable: %w", name, detectErr)
+	}
+	if name != "" || auto {
+		logger.Warningf("No usable campus interface (%v); falling back to system routing", detectErr)
+	}
+	if degraded == "" {
+		degraded = name
+	}
+	return nil, degraded, nil
+}
+
+// Healthy reports whether the requested adapter is actually in use. It is
+// false when the binding degraded, so a daemon can re-resolve the interface
+// after Wi-Fi comes back instead of silently probing through the wrong route.
+//
+// A binding is also unhealthy when the adapter kept its name but changed its
+// address: a pinned source address that no longer exists on the adapter makes
+// every dial fail, which a long running daemon must recover from.
+func (n *Net) Healthy() bool {
+	if n == nil {
+		return true
+	}
+	if n.Interface == nil {
+		// A binding was requested but could not be applied.
+		return n.Requested == ""
+	}
+	if n.Requested != "" && !strings.EqualFold(n.Interface.Name, n.Requested) {
+		return false
+	}
+	if !hasGlobalIPv4(n.Interface) {
+		return false
+	}
+	if n.SourceIP != nil && !n.interfaceHasIP(n.SourceIP) {
+		return false
+	}
+	return true
+}
+
+// interfaceHasIP reports whether iface still holds ip. DHCP renewal changes the
+// address under a bound daemon, and a stale pinned source address turns every
+// dial into "cannot assign requested address".
+func (n *Net) interfaceHasIP(ip net.IP) bool {
+	addrs, err := n.Interface.Addrs()
+	if err != nil {
+		return true // cannot tell; do not force a pointless rebind
+	}
+	for _, addr := range addrs {
+		var candidate net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			candidate = v.IP
+		case *net.IPAddr:
+			candidate = v.IP
+		}
+		if candidate != nil && candidate.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// DegradedReason explains why the requested adapter is not in use, or returns
+// an empty string when it is.
+func (n *Net) DegradedReason() string {
+	if n == nil {
+		return ""
+	}
+	return n.Missing
+}
+
 func (n *Net) describe() string {
 	parts := make([]string, 0, 3)
 	if n.Interface != nil {
@@ -167,7 +300,11 @@ func (n *Net) describe() string {
 	if len(parts) == 0 {
 		return "system routing"
 	}
-	return strings.Join(parts, " ")
+	desc := strings.Join(parts, " ")
+	if n.Missing != "" {
+		desc += " (degraded from " + n.Missing + ")"
+	}
+	return desc
 }
 
 // Description returns a short human readable summary of the binding.
